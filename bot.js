@@ -1,3 +1,4 @@
+if (!global.crypto) { global.crypto = require('crypto').webcrypto; }
 const makeWASocket = require('@whiskeysockets/baileys').default;
 const { useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
