@@ -1,21 +1,36 @@
 const makeWASocket = require('@whiskeysockets/baileys').default;
 const { useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const qrcode = require('qrcode-terminal');
 const cron = require('node-cron');
 const express = require('express');
 const app = express();
 
-const NOMOR_KAMU = '6282112707476@s.whatsapp.net'; // GANTI JADI NOMOR KAMU! contoh 6281234567890@s.whatsapp.net
+const NOMOR_KAMU = '6282112707476@s.whatsapp.net'; // GANTI NOMOR KAMU
 const JAM_KERJA = 9.5;
-
 let sock;
 let jadwalPulang = null;
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth');
-    sock = makeWASocket({ auth: state, printQRInTerminal: true });
+    sock = makeWASocket({ auth: state, printQRInTerminal: false });
+
     sock.ev.on('creds.update', saveCreds);
-    sock.ev.on('connection.update', (u) => {
-        if (u.connection === 'close') startBot();
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        // INI YANG BIKIN QR MUNCUL
+        if (qr) {
+            console.log('QR CODE BARU, SCAN SEKARANG:');
+            qrcode.generate(qr, { small: true });
+        }
+
+        if (connection === 'close') {
+            console.log('Koneksi terputus, coba sambung lagi...');
+            startBot();
+        } else if (connection === 'open') {
+            console.log('✅ Bot 24 Jam Connect!');
+        }
     });
 
     sock.ev.on('messages.upsert', async ({ messages }) => {
@@ -32,7 +47,7 @@ async function startBot() {
 
         if (jadwalPulang) jadwalPulang.stop();
         jadwalPulang = cron.schedule(`${datePulang.getMinutes()} ${datePulang.getHours()} * * *`, async () => {
-            await sock.sendMessage(NOMOR_KAMU, { text: `🔔 Waktunya Absen Pulang!\nMasuk jam ${text}, sudah 9.5 jam kerja. Jangan lupa absen!` });
+            await sock.sendMessage(NOMOR_KAMU, { text: `🔔 Waktunya Absen Pulang! Masuk jam ${text}, sudah 9.5 jam. Jangan lupa absen!` });
             jadwalPulang.stop();
         }, { timezone: "Asia/Jakarta" });
 
@@ -45,5 +60,6 @@ async function startBot() {
     }, { timezone: "Asia/Jakarta" });
 }
 startBot();
-app.get('/', (req,res) => res.send('Bot Jalan 24 Jam'));
+
+app.get('/', (req,res) => res.send('Bot Jalan 24 Jam - QR ada di Logs'));
 app.listen(process.env.PORT || 3000);
