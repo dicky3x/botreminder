@@ -6,7 +6,7 @@ const cron = require('node-cron');
 const express = require('express');
 const app = express();
 
-const NOMOR_KAMU = '62812xxxxxxx@s.whatsapp.net'; // GANTI NOMOR KAMU
+const NOMOR_KAMU = '6282112707476@s.whatsapp.net'; // GANTI NOMOR KAMU
 const JAM_KERJA = 9.5;
 let sock;
 let jadwalPulang = null;
