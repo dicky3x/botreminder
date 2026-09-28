@@ -1,12 +1,19 @@
 {
-  "name": "bot-absen-24jam",
+  "name": "wa-work-reminder",
+  "version": "1.0.0",
+  "description": "WhatsApp Reminder Jam Pulang Kerja Bot",
   "main": "bot.js",
-  "scripts": { "start": "node bot.js" },
+  "scripts": {
+    "start": "node bot.js"
+  },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.8",
+    "@whiskeysockets/baileys": "^6.7.18",
+    "express": "^4.21.2",
     "node-cron": "^3.0.3",
-    "express": "^4.18.2",
-    "qrcode": "^1.5.3",
+    "pino": "^9.6.0",
     "qrcode-terminal": "^0.12.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

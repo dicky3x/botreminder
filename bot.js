@@ -1,79 +1,249 @@
-if (!global.crypto) { global.crypto = require('crypto').webcrypto; }
-const makeWASocket = require('@whiskeysockets/baileys').default;
-const { useMultiFileAuthState } = require('@whiskeysockets/baileys');
-const QRCode = require('qrcode');
-const cron = require('node-cron');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
 const express = require('express');
+const cron = require('node-cron');
+const qrcode = require('qrcode-terminal');
+const pino = require('pino');
+
+// ==========================================
+// CONFIGURATION & CONSTANTS
+// ==========================================
+const TEST_MODE = false; // Ubah ke true jika ingin testing jeda 2 menit
+const TARGET_PHONE = '6282112707476';
+const KNOWN_TARGET_LID = '198689582755972@lid';
+const TARGET_JID_PHONE = `${TARGET_PHONE}@s.whatsapp.net`;
+
+const PORT = process.env.PORT || 3000;
+
+// In-Memory Storage
+let clockInTime = null; // Menyimpan string HH:MM
+let scheduledReminderTimer = null; // Handler setTimeout
+let sock = null;
+
+// ==========================================
+// EXPRESS KEEP-ALIVE SERVER
+// ==========================================
 const app = express();
-
-const NOMOR_KAMU = '6282112707476@s.whatsapp.net'; // GANTI NOMOR KAMU
-const JAM_KERJA = 9.5;
-let sock;
-let jadwalPulang = null;
-let latestQR = null; // simpan QR terakhir
-
-async function startBot() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth');
-    sock = makeWASocket({ auth: state, printQRInTerminal: false });
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, qr } = update;
-        if (qr) {
-            latestQR = qr;
-            console.log('QR BARU! Buka link website kamu untuk scan!');
-        }
-        if (connection === 'close') startBot();
-        if (connection === 'open') {
-            console.log('✅ Bot Connect!');
-            latestQR = null; // hapus QR kalau sudah connect
-        }
-    });
-
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        const msg = messages[0];
-        if (!msg.message || msg.key.fromMe) return;
-        if (msg.key.remoteJid!== NOMOR_KAMU) return;
-        const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
-        if (!/^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$/.test(text)) return;
-        const [jam, menit] = text.split(':').map(Number);
-        const datePulang = new Date();
-        datePulang.setHours(jam, menit, 0);
-        datePulang.setTime(datePulang.getTime() + JAM_KERJA * 3600000);
-        if (jadwalPulang) jadwalPulang.stop();
-        jadwalPulang = cron.schedule(`${datePulang.getMinutes()} ${datePulang.getHours()} * * *`, async () => {
-            await sock.sendMessage(NOMOR_KAMU, { text: `🔔 Waktunya Absen Pulang! Masuk jam ${text}` });
-            jadwalPulang.stop();
-        }, { timezone: "Asia/Jakarta" });
-        const jamPulangStr = `${String(datePulang.getHours()).padStart(2,'0')}:${String(datePulang.getMinutes()).padStart(2,'0')}`;
-        await sock.sendMessage(NOMOR_KAMU, { text: `Sip! Masuk jam ${text} dicatat. Pulang jam ${jamPulangStr} WIB ✅` });
-    });
-
-    cron.schedule('10 8 * * 1-5', async () => {
-        await sock.sendMessage(NOMOR_KAMU, { text: `☀️ Selamat pagi! Jam berapa masuk hari ini? Balas HH:MM contoh 07:45` });
-    }, { timezone: "Asia/Jakarta" });
-}
-startBot();
-
-// HALAMAN UNTUK SCAN QR YANG UTUH
-app.get('/', async (req, res) => {
-    if (!latestQR) {
-        return res.send('<h2>✅ Bot sudah terhubung! Tidak perlu scan lagi.</h2><p>QR akan muncul lagi jika koneksi terputus.</p>');
-    }
-    try {
-        const qrImage = await QRCode.toDataURL(latestQR);
-        res.send(`
-            <html><body style="text-align:center; font-family:sans-serif; padding:20px">
-            <h2>Scan QR WhatsApp Kamu</h2>
-            <p>QR akan refresh otomatis tiap 30 detik. Buka di HP > WhatsApp > Linked Devices > Link Device</p>
-            <img src="${qrImage}" style="width:300px; height:300px; border:10px solid white; box-shadow:0 0 10px #ccc"/>
-            <p><i>Jika gagal, refresh halaman ini</i></p>
-            <script>setTimeout(()=>location.reload(), 30000)</script>
-            </body></html>
-        `);
-    } catch (e) {
-        res.send('Gagal generate QR, refresh lagi');
-    }
+app.get('/', (req, res) => {
+  res.status(200).send('Bot OK - WhatsApp Reminder Active');
 });
 
-app.listen(process.env.PORT || 3000);
+app.listen(PORT, () => {
+  console.log(`[EXPRESS] Keep-alive server running on port ${PORT}`);
+});
+
+// ==========================================
+// HELPER FUNCTIONS
+// ==========================================
+
+// Safe Message Sender (mencegah crash akibat Error 463 / ACK Timeout)
+async function safeSendMessage(jid, content) {
+  if (!sock) {
+    console.error('[WA] Cannot send message: Socket is not initialized.');
+    return;
+  }
+  try {
+    const result = await sock.sendMessage(jid, content);
+    console.log(`[WA] Message sent successfully to ${jid}`);
+    return result;
+  } catch (error) {
+    console.error(`[WA ERROR] Failed to send message to ${jid}:`, error);
+  }
+}
+
+// Menghitung jam pulang (ditambah 9 jam 30 menit)
+function calculateClockOut(timeStr) {
+  const [hours, minutes] = timeStr.split(':').map(Number);
+  const clockInDate = new Date();
+  clockInDate.setHours(hours, minutes, 0, 0);
+
+  // Tambah 9.5 jam (9 jam 30 menit)
+  const clockOutDate = new Date(clockInDate.getTime() + (9.5 * 60 * 60 * 1000));
+  
+  const outHours = String(clockOutDate.getHours()).padStart(2, '0');
+  const outMinutes = String(clockOutDate.getMinutes()).padStart(2, '0');
+  
+  return {
+    clockOutStr: `${outHours}:${outMinutes}`,
+    targetTimestamp: clockOutDate.getTime()
+  };
+}
+
+// Menjadwalkan pengiriman reminder jam pulang
+function scheduleReturnReminder(clockInStr, targetTimestamp) {
+  if (scheduledReminderTimer) {
+    clearTimeout(scheduledReminderTimer);
+  }
+
+  const { clockOutStr } = calculateClockOut(clockInStr);
+  let delayMs = 0;
+
+  if (TEST_MODE) {
+    delayMs = 2 * 60 * 1000; // 2 Menit dalam Test Mode
+    console.log(`[TEST MODE] Reminder dijadwalkan dalam 2 menit.`);
+  } else {
+    delayMs = targetTimestamp - Date.now();
+  }
+
+  if (delayMs <= 0) {
+    console.log('[WA] Waktu clock-out sudah lewat untuk hari ini.');
+    return;
+  }
+
+  console.log(`[SCHEDULE] Reminder pulang dijadwalkan dalam ${(delayMs / 1000 / 60).toFixed(1)} menit.`);
+
+  scheduledReminderTimer = setTimeout(async () => {
+    const message = `🔔 Waktunya Pulang! Masuk jam ${clockInStr}, pulang jam ${clockOutStr}`;
+    
+    // Kirim ke LID utama dan fallback Phone JID
+    await safeSendMessage(KNOWN_TARGET_LID, { text: message });
+    
+    // Reset state
+    clockInTime = null;
+    scheduledReminderTimer = null;
+  }, delayMs);
+}
+
+// ==========================================
+// MAIN BOT CONNECTION
+// ==========================================
+async function startBot() {
+  console.log('[WA] Starting WhatsApp Bot...');
+
+  // 1. Multi-file Auth State disimpan di /tmp/auth agar terhindar dari krisis izin di Railway
+  const { state, saveCreds } = await useMultiFileAuthState('/tmp/auth');
+  const { version } = await fetchLatestBaileysVersion();
+
+  // 2. Solusi Wajib atasi Error 463 & ACK Timeout
+  sock = makeWASocket({
+    version,
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: false,
+    syncFullHistory: false,
+    markOnlineOnConnect: true,
+    fireInitQueries: false,
+    browser: ["Chrome", "Chrome", "120"]
+  });
+
+  // Handle Event Credentials Update
+  sock.ev.on('creds.update', saveCreds);
+
+  // Handle Connection Updates
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log('\n================ QR CODE ================');
+      qrcode.generate(qr, { small: true });
+      console.log('=========================================\n');
+    }
+
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      
+      console.log(`[WA] Connection closed. Reason code: ${statusCode}. Reconnecting in 3s: ${shouldReconnect}`);
+      
+      if (shouldReconnect) {
+        setTimeout(startBot, 3000);
+      } else {
+        console.log('[WA] Connection logged out. Cleaning auth directory recommended.');
+      }
+    } else if (connection === 'open') {
+      console.log('[WA] WhatsApp Connection Successfully Opened! 🎉');
+      setupCronJobs();
+    }
+  });
+
+  // Handle Incoming Messages
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const msg of messages) {
+      if (!msg.message || msg.key.fromMe) continue;
+
+      const remoteJid = msg.key.remoteJid;
+      const text = (
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        ''
+      ).trim();
+
+      // LOG SEMUA PESAN MASUK (Sesuai instruksi debug)
+      console.log(`\n[PESAN MASUK] From JID: ${remoteJid} | Text: "${text}"`);
+
+      // RESPONSE DEBUG & UNTUK MENGETAHUI LID PENGIRIM
+      if (text.toLowerCase() === 'ping' || text.toLowerCase() === 'lid') {
+        await safeSendMessage(remoteJid, {
+          text: `🤖 Bot Online!\nJID/LID Anda adalah: *${remoteJid}*`
+        });
+        continue;
+      }
+
+      // CHECK FILTER TARGET SENDER (Bisa via LID atau Phone JID)
+      const isTargetUser = (remoteJid === KNOWN_TARGET_LID) || 
+                           (remoteJid === TARGET_JID_PHONE) || 
+                           (remoteJid.includes(TARGET_PHONE));
+
+      if (!isTargetUser) {
+        console.log(`[IGNORE] Pesan diabaikan karena bukan dari target nomor A.`);
+        continue;
+      }
+
+      // PARSING FORMAT HH:MM (contoh: 08:30 atau 8:30)
+      const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
+      if (timeRegex.test(text)) {
+        // Normalize time (misal "8:30" jadi "08:30")
+        const [h, m] = text.split(':');
+        clockInTime = `${h.padStart(2, '0')}:${m}`;
+
+        const { clockOutStr, targetTimestamp } = calculateClockOut(clockInTime);
+
+        // Balas Konfirmasi
+        const replyText = `Sip! Masuk ${clockInTime} dicatat ✅ Pulang jam ${clockOutStr}`;
+        await safeSendMessage(remoteJid, { text: replyText });
+
+        // Jadwalkan Reminder
+        scheduleReturnReminder(clockInTime, targetTimestamp);
+      }
+    }
+  });
+}
+
+// ==========================================
+// CRON JOBS SETUP (Senin - Jumat)
+// ==========================================
+let cronInitialized = false;
+
+function setupCronJobs() {
+  if (cronInitialized) return;
+  cronInitialized = true;
+
+  console.log('[CRON] Initializing Scheduled Jobs...');
+
+  // 1. Setiap Senin - Jumat jam 08:10 WIB (Asia/Jakarta)
+  cron.schedule('10 8 * * 1-5', async () => {
+    console.log('[CRON] Running 08:10 Morning Clock-in Query...');
+    const message = 'Selamat pagi. Jam berapa clock in hari ini?';
+    await safeSendMessage(KNOWN_TARGET_LID, { text: message });
+  }, {
+    timezone: 'Asia/Jakarta'
+  });
+
+  // 2. Setiap jam 16:40 WIB
+  cron.schedule('40 16 * * *', async () => {
+    console.log('[CRON] Running 16:40 Kyna Pickup Reminder...');
+    const message = 'JEMPUT KYNA full day hari ini!!!';
+    await safeSendMessage(KNOWN_TARGET_LID, { text: message });
+  }, {
+    timezone: 'Asia/Jakarta'
+  });
+}
+
+// Start Application
+startBot();
