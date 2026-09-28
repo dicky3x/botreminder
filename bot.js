@@ -9,6 +9,8 @@ const cron = require('node-cron');
 const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const pino = require('pino');
+const fs = require('fs');
+const path = require('path');
 
 // Set timezone proses ke Asia/Jakarta
 process.env.TZ = 'Asia/Jakarta';
@@ -20,13 +22,14 @@ const TEST_MODE = false; // Ubah ke true jika ingin testing jeda 2 menit
 const TARGET_PHONE = '6282112707476';
 const KNOWN_TARGET_LID = '198689582755972@lid';
 const TARGET_JID_PHONE = `${TARGET_PHONE}@s.whatsapp.net`;
+const AUTH_DIR = '/tmp/auth';
 
 const PORT = process.env.PORT || 3000;
 
 // State Global
 let currentQR = null;
 let isConnected = false;
-let activeReturnCronTask = null; // Menyimpan task cron pengingat pulang
+let activeReturnCronTask = null;
 let sock = null;
 
 // ==========================================
@@ -41,12 +44,12 @@ app.get('/', (req, res) => {
     res.status(200).send(`
       <div style="font-family: sans-serif; text-align: center; padding-top: 50px;">
         <h2>Bot Belum Terhubung!</h2>
-        <p>Silakan lakukan scan QR Code di link berikut:</p>
+        <p>Silakan scan QR Code di URL berikut:</p>
         <a href="/qr" style="display: inline-block; padding: 10px 20px; background: #25D366; color: white; border-radius: 5px; text-decoration: none; font-weight: bold;">Buka Scan QR Code</a>
       </div>
     `);
   } else {
-    res.status(200).send('Bot OK - Sedang menyiapkan QR Code...');
+    res.status(200).send('Bot OK - Sedang menghubungkan / menyiapkan QR...');
   }
 });
 
@@ -63,8 +66,8 @@ app.get('/qr', async (req, res) => {
   if (!currentQR) {
     return res.send(`
       <div style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-        <h2>Sedang Membuat QR Code...</h2>
-        <p>Halaman ini akan otomatis me-refresh dalam 5 detik.</p>
+        <h2>Sedang Memuat QR Code...</h2>
+        <p>Halaman akan me-refresh otomatis dalam 5 detik.</p>
         <script>setTimeout(() => location.reload(), 5000);</script>
       </div>
     `);
@@ -109,34 +112,43 @@ app.listen(PORT, () => {
 // HELPER FUNCTIONS
 // ==========================================
 
+// Fungsi pembersih folder auth jika terjadi corrupt
+function clearAuthFolder() {
+  try {
+    if (fs.existsSync(AUTH_DIR)) {
+      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+      console.log('[AUTH] Sesi lama dibersihkan dari /tmp/auth');
+    }
+  } catch (e) {
+    console.error('[AUTH ERROR] Gagal menghapus sesi lama:', e);
+  }
+}
+
 async function safeSendMessage(jid, content) {
-  if (!sock) {
-    console.error('[WA] Cannot send message: Socket is not initialized.');
+  if (!sock || !isConnected) {
+    console.error(`[WA ERROR] Gagal mengirim pesan ke ${jid}: Socket belum siap/terhubung.`);
     return;
   }
   try {
     const result = await sock.sendMessage(jid, content);
-    console.log(`[WA] Message sent successfully to ${jid}`);
+    console.log(`[WA] Pesan berhasil terkirim ke ${jid}`);
     return result;
   } catch (error) {
-    console.error(`[WA ERROR] Failed to send message to ${jid}:`, error);
+    console.error(`[WA ERROR] Gagal mengirim pesan ke ${jid}:`, error.message || error);
   }
 }
 
-// Menghitung jam pulang berbasis Waktu Indonesia Barat (WIB)
+// Menghitung jam pulang WIB (Ditambah 9 jam 30 menit)
 function calculateClockOutWIB(timeStr) {
   const [hours, minutes] = timeStr.split(':').map(Number);
   
-  // Dapatkan tanggal/waktu saat ini di WIB
   const now = new Date();
   const nowWibString = now.toLocaleString("en-US", { timeZone: "Asia/Jakarta" });
   const wibDate = new Date(nowWibString);
 
-  // Buat objek tanggal masuk
   const clockInDate = new Date(wibDate);
   clockInDate.setHours(hours, minutes, 0, 0);
 
-  // Tambah 9 jam 30 menit
   const clockOutDate = new Date(clockInDate.getTime() + (9.5 * 60 * 60 * 1000));
 
   const outHours = String(clockOutDate.getHours()).padStart(2, '0');
@@ -149,37 +161,37 @@ function calculateClockOutWIB(timeStr) {
   };
 }
 
-// Menjadwalkan pengingat pulang menggunakan node-cron
-function scheduleReturnReminder(clockInStr) {
-  // Hentikan jadwal pengingat lama jika ada
+// Menjadwalkan pengingat pulang
+function scheduleReturnReminder(clockInStr, replyJid) {
   if (activeReturnCronTask) {
     activeReturnCronTask.stop();
     activeReturnCronTask = null;
   }
 
+  const { clockOutHours, clockOutMinutes, clockOutStr } = calculateClockOutWIB(clockInStr);
+
   if (TEST_MODE) {
     console.log(`[TEST MODE] Reminder akan dikirim dalam 2 menit.`);
     setTimeout(async () => {
-      const { clockOutStr } = calculateClockOutWIB(clockInStr);
       const message = `🔔 Waktunya Pulang! Masuk jam ${clockInStr}, pulang jam ${clockOutStr}`;
-      await safeSendMessage(KNOWN_TARGET_LID, { text: message });
+      await safeSendMessage(replyJid, { text: message });
     }, 2 * 60 * 1000);
     return;
   }
 
-  const { clockOutHours, clockOutMinutes, clockOutStr } = calculateClockOutWIB(clockInStr);
-
-  // Format Ekspresi Cron: "menit jam hari bulan hari_dalam_minggu"
   const cronExpression = `${clockOutMinutes} ${clockOutHours} * * *`;
-
-  console.log(`[SCHEDULE] Menjadwalkan Cron Reminder Pulang pada pukul ${clockOutStr} WIB (${cronExpression})`);
+  console.log(`[SCHEDULE] Menjadwalkan Cron Reminder Pulang pukul ${clockOutStr} WIB (${cronExpression})`);
 
   activeReturnCronTask = cron.schedule(cronExpression, async () => {
-    console.log(`[CRON] Waktunya pulang! Mengirim pesan ke target...`);
+    console.log(`[CRON] Waktunya pulang! Mengirim pesan...`);
     const message = `🔔 Waktunya Pulang! Masuk jam ${clockInStr}, pulang jam ${clockOutStr}`;
-    await safeSendMessage(KNOWN_TARGET_LID, { text: message });
+    
+    // Kirim ke pengirim spesifik & fallback ke LID
+    await safeSendMessage(replyJid, { text: message });
+    if (replyJid !== KNOWN_TARGET_LID) {
+      await safeSendMessage(KNOWN_TARGET_LID, { text: message });
+    }
 
-    // Matikan task setelah berjalan sekali
     if (activeReturnCronTask) {
       activeReturnCronTask.stop();
       activeReturnCronTask = null;
@@ -194,9 +206,9 @@ function scheduleReturnReminder(clockInStr) {
 // MAIN BOT CONNECTION
 // ==========================================
 async function startBot() {
-  console.log('[WA] Starting WhatsApp Bot...');
+  console.log('[WA] Mengawali koneksi WhatsApp Bot...');
 
-  const { state, saveCreds } = await useMultiFileAuthState('/tmp/auth');
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
@@ -212,29 +224,36 @@ async function startBot() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
       currentQR = qr;
-      console.log('\n[QR] QR Code Baru Tersedia! Akses via browser: https://botreminder-production.up.railway.app/qr\n');
+      console.log('\n[QR] QR Code Baru Tersedia! Buka di browser:');
+      console.log('👉 https://botreminder-production.up.railway.app/qr\n');
       qrcodeTerminal.generate(qr, { small: true });
     }
 
     if (connection === 'close') {
       isConnected = false;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      console.log(`[WA] Connection closed. Status Code: ${statusCode}`);
 
-      console.log(`[WA] Connection closed (${statusCode}). Reconnecting in 3s...`);
-
-      if (shouldReconnect) {
+      if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+        console.log('[WA] Sesi telah dihancurkan/logged out. Membersihkan auth...');
+        clearAuthFolder();
+        currentQR = null;
+        setTimeout(startBot, 3000);
+      } else {
+        console.log('[WA] Mencoba terhubung kembali dalam 3 detik...');
         setTimeout(startBot, 3000);
       }
     } else if (connection === 'open') {
       isConnected = true;
       currentQR = null;
-      console.log('[WA] WhatsApp Connection Successfully Opened! 🎉');
+      console.log('================================================');
+      console.log('🎉 WhatsApp Connection Successfully Opened! 🎉');
+      console.log('================================================');
       setupCronJobs();
     }
   });
@@ -252,8 +271,10 @@ async function startBot() {
         ''
       ).trim();
 
-      console.log(`\n[PESAN MASUK] From JID: ${remoteJid} | Text: "${text}"`);
+      // Log untuk debug di Railway Console
+      console.log(`\n[PESAN MASUK] From: ${remoteJid} | Text: "${text}"`);
 
+      // 1. Respon PING / LID (Bisa dipakai siapa saja untuk mengecek status & LID)
       if (text.toLowerCase() === 'ping' || text.toLowerCase() === 'lid') {
         await safeSendMessage(remoteJid, {
           text: `🤖 Bot Online!\nJID/LID Anda adalah: *${remoteJid}*`
@@ -261,15 +282,17 @@ async function startBot() {
         continue;
       }
 
+      // 2. Filter Pengirim
       const isTargetUser = (remoteJid === KNOWN_TARGET_LID) || 
                            (remoteJid === TARGET_JID_PHONE) || 
                            (remoteJid.includes(TARGET_PHONE));
 
       if (!isTargetUser) {
-        console.log(`[IGNORE] Pesan diabaikan karena bukan dari target.`);
+        console.log(`[IGNORE] Pesan dari ${remoteJid} diabaikan (bukan Target).`);
         continue;
       }
 
+      // 3. Format Jam Masuk (HH:MM)
       const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
       if (timeRegex.test(text)) {
         const [h, m] = text.split(':');
@@ -280,8 +303,8 @@ async function startBot() {
         const replyText = `Sip! Masuk ${formattedClockIn} dicatat ✅ Pulang jam ${clockOutStr}`;
         await safeSendMessage(remoteJid, { text: replyText });
 
-        // Jadwalkan Reminder dengan Cron spesifik WIB
-        scheduleReturnReminder(formattedClockIn);
+        // Jadwalkan reminder menggunakan remoteJid pengirim langsung
+        scheduleReturnReminder(formattedClockIn, remoteJid);
       }
     }
   });
@@ -298,20 +321,22 @@ function setupCronJobs() {
 
   console.log('[CRON] Initializing Scheduled Jobs...');
 
-  // 1. Pagi Jam 08:10 WIB (Senin - Jumat)
+  // 1. Jam 08:10 WIB (Senin - Jumat)
   cron.schedule('10 8 * * 1-5', async () => {
     console.log('[CRON] Running 08:10 Morning Clock-in Query...');
     const message = 'Selamat pagi. Jam berapa clock in hari ini?';
     await safeSendMessage(KNOWN_TARGET_LID, { text: message });
+    await safeSendMessage(TARGET_JID_PHONE, { text: message });
   }, {
     timezone: 'Asia/Jakarta'
   });
 
-  // 2. Sore Jam 16:40 WIB (Setiap Hari)
+  // 2. Jam 16:40 WIB (Setiap Hari)
   cron.schedule('40 16 * * *', async () => {
     console.log('[CRON] Running 16:40 Kyna Pickup Reminder...');
     const message = 'JEMPUT KYNA full day hari ini!!!';
     await safeSendMessage(KNOWN_TARGET_LID, { text: message });
+    await safeSendMessage(TARGET_JID_PHONE, { text: message });
   }, {
     timezone: 'Asia/Jakarta'
   });
